@@ -1,0 +1,85 @@
+name: Accessibility PR diff
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Folder of static .html files, relative to the repository root.
+  PAGES_DIR: pages
+
+jobs:
+  a11y-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # The tool is installed from the base branch so a PR cannot change the checker that scores it.
+      - name: Install tool
+        working-directory: base
+        run: npm ci
+
+      - name: Scan base and head, compare
+        id: diff
+        env:
+          REPORT: ${{ runner.temp }}/a11y-report.md
+        run: |
+          set +e
+          node base/src/cli.js --base "base/$PAGES_DIR" --head "head/$PAGES_DIR" > "$REPORT"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ -s "$REPORT" ]; then echo "has_new=true" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+
+      - name: Post or update PR comment
+        if: steps.diff.outputs.has_new == 'true'
+        uses: actions/github-script@v7
+        env:
+          REPORT: ${{ runner.temp }}/a11y-report.md
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- a11y-pr-diff -->';
+            const body = `${marker}\n${fs.readFileSync(process.env.REPORT, 'utf8')}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fail on new serious or critical violations
+        if: always()
+        env:
+          EXIT_CODE: ${{ steps.diff.outputs.exit_code }}
+        run: |
+          code="${EXIT_CODE:-2}"
+          if [ "$code" -ne 0 ]; then
+            echo "a11y-pr-diff exited with $code"
+            exit "$code"
+          fi
